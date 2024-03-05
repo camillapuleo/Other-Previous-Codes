@@ -6,7 +6,7 @@
 %  with (or without) Taste Shocks" (QE, 2017)
 
 
-classdef my_model_migration < handle
+classdef model_migration < handle
 % This class defines a Deaton consumption-savings model
 
 properties (Access=public)
