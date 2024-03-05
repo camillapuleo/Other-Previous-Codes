@@ -1,0 +1,421 @@
+###############################################################################
+#                            Camilla Puleo                                    #
+#                           18 December 2023                                  #
+###############################################################################
+
+### IMPORTING PACKAGES ########################################################
+import pandas as pd
+from sqlalchemy import create_engine
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+import xgboost as xgb
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
+from sklearn.model_selection import learning_curve
+from sklearn.metrics import classification_report
+from sklearn.preprocessing import TargetEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GridSearchCV
+from sklearn.metrics import accuracy_score, confusion_matrix, recall_score, 
+precision_score, precision_recall_curve, auc
+
+
+###############################################################################
+#                                SETUP                                        #
+###############################################################################
+
+### Connecting to sql and importing the data:
+host = "mysql-1.cda.hhs.se"
+username = "7313"
+password = "data"
+schema = "Survivability"
+connection_string = "mysql+pymysql://{}:{}@{}/{}".format(username, password, host, 
+schema)
+connection = create_engine(connection_string)
+query1 = """
+SELECT id FROM Patient 
+LEFT JOIN Study
+ON Patient.id = Study.patient_id
+WHERE days_before_discharge IS NULL
+"""
+
+classification_set = pd.read_sql_query(con=connection.connect(), sql=(query1))
+classification_set.rename(columns={"id": "patient_id"}, inplace=True)
+
+###############################################################################
+#                               QUESTION 1                                    #
+###############################################################################
+
+### Importing the PatientExamination table
+query2 = """
+SELECT * FROM PatientExamination 
+"""
+patient_exam = pd.read_sql_query(con=connection.connect(), sql=(query2))
+
+### Creating additional columns with the patient examination"s results for each 
+### measurement category:
+ 
+patient_exam_new = patient_exam.pivot_table(index="patient_id",
+ columns="measurement",
+ values="value",
+ aggfunc="first") 
+for column in patient_exam_new.columns:
+ if column != "Zodiac Sign" and column != "Has Cancer":
+ patient_exam_new[column]=patient_exam_new[column].astype(float)
+patient_exam_new.reset_index(inplace=True)
+white_blood_cell_count = patient_exam_new[["patient_id","White Blood Cell Count"]]
+
+### Creating a density plot:
+fig, axes = plt.subplots(1, 1, figsize=(16, 10), dpi=300) 
+sns.kdeplot(white_blood_cell_count["White Blood Cell Count"], label="Density", 
+shade=True, ax=axes)
+axes.set_title("", fontsize=40) 
+axes.set_xlabel("White Blood Cell Count", fontsize=25) 
+axes.set_ylabel("Density", fontsize=25) 
+median_value = white_blood_cell_count["White Blood Cell Count"].median()
+axes.axvline(median_value, color="red", linestyle="dashed", linewidth=2, 
+label="Median")
+axes.set_xticks(np.arange(0, 210, 20))
+axes.tick_params(axis="both", which="major", labelsize=25) 
+plt.tight_layout()
+plt.legend(fontsize=25) 
+plt.show()
+
+### The median value and the mean are:
+print(white_blood_cell_count["White Blood Cell Count"].median())
+print(white_blood_cell_count["White Blood Cell Count"].mean())
+white_blood_cell_count["White Blood Cell Count"] = white_blood_cell_count["White 
+Blood Cell Count"].round().astype("Int64")
+
+###############################################################################
+#                               QUESTION 2                                    #
+###############################################################################
+
+### Importing the joined datasets Patient and Study 
+query3 = """
+SELECT * FROM Patient 
+LEFT JOIN Study
+ON Patient.id = Study.patient_id
+"""
+df = pd.read_sql_query(con=connection.connect(), sql=(query3))
+
+### Merging the edited patient examination dataset
+df_merge = pd.merge(df, patient_exam_new, left_on="id", right_on="patient_id", 
+how="left")
+df_merge = df_merge.drop(columns=["patient_id_x", "patient_id_y"])
+
+### Now df_merge is our complete dataset with all the variables available in 
+### the Survivability schema
+
+######################### FEATURE ENGINEERING #################################
+
+### Defining a function for encoding and scaling:
+def category_encoding(colname, data):
+ # create the encoder class
+ encoder = TargetEncoder(target_type="continuous",
+ cv=10, smooth="auto", shuffle=False)
+ # divide data into train and test depending on sell price NA or not
+ x_train = data[colname][data.died_in_hospital.notna()].values.reshape(-1, 1)
+ y_train = data.died_in_hospital[data.died_in_hospital.notna()].values
+ encoder.fit(x_train, y_train)
+ # transform the column
+ x_new = encoder.transform(data[colname].values.reshape(-1, 1))
+ # also scale them 
+ return MinMaxScaler().fit_transform(x_new)
+
+### Creating a copy to keep the unedited data:
+df_merge_copy = df_merge.copy(deep = True)
+### Visualising the missing values in a heatmap
+plt.figure(figsize=(15, 12))
+sns.heatmap(df_merge_copy.T.isnull(), cbar=False, cmap="magma", xticklabels=False)
+plt.show()
+
+### Creating columns for admission day, month and year:
+df_merge_copy.admission_date = pd.to_datetime(df_merge_copy.admission_date)
+df_merge_copy["admission_day"] = df_merge_copy.admission_date.dt.day
+df_merge_copy["admission_month"] = df_merge_copy.admission_date.dt.month
+df_merge_copy["admission_year"] = df_merge_copy.admission_date.dt.year
+df_merge_copy = df_merge_copy.drop(columns=["admission_date"])
+
+### Creating columns for study entry day, month and year:
+df_merge_copy.study_entry_date = pd.to_datetime(df_merge_copy.study_entry_date)
+df_merge_copy["study_entry_day"] = df_merge_copy.study_entry_date.dt.day
+df_merge_copy["study_entry_month"] = df_merge_copy.study_entry_date.dt.month
+df_merge_copy["study_entry_year"] = df_merge_copy.study_entry_date.dt.year
+df_merge_copy = df_merge_copy.drop(columns=["study_entry_date"])
+
+### Identifying categorical variables:
+categorical_variables = df_merge_copy.select_dtypes(exclude=["number"]).columns
+print("\nCategorical Variables:")
+print(categorical_variables)
+
+### Encoding non numerical variables:
+ 
+for col in df_merge_copy.columns:
+ if not pd.api.types.is_numeric_dtype(df_merge_copy[col]):
+ df_merge_copy[col]=category_encoding(col, df_merge_copy)
+ 
+### Dropping useless columns:
+df_merge_copy = 
+df_merge_copy.drop(columns=["death_recorded_after_hospital_discharge", 
+ "days_of_follow_up", 
+ "days_in_hospital_before_study", 
+ "admission_day", 
+ "study_entry_day", 
+ "study_entry_month", 
+ "study_entry_year",
+ "Zodiac Sign",
+ "language"])
+
+### Removing NAs 
+for column in df_merge_copy.columns:
+ if column != "days_before_discharge" and column != "id" and column != 
+"died_in_hospital" :
+ median_value = df_merge_copy[column].median()
+ df_merge_copy[column].fillna(median_value, inplace=True)
+ 
+### Visualising the missing values in a heatmap
+plt.figure(figsize=(15, 12))
+sns.heatmap(df_merge_copy.T.isnull(), cbar=False, cmap="magma", xticklabels=False)
+plt.show()
+### Saving the NA free data for later use:
+ 
+df_merge_copy_notna = df_merge_copy.copy(deep = True)
+
+###############################################################################
+############################### XGBoost #######################################
+###############################################################################
+
+### Separating data into the classification set and our training and testing set:
+df_merge_trainxg = 
+df_merge_copy_notna[df_merge_copy_notna.days_before_discharge.notna()]
+df_merge_xgpredict = 
+df_merge_copy_notna[df_merge_copy_notna.days_before_discharge.isnull()]
+df_merge_trainxg = df_merge_trainxg.drop(columns=["id", "days_before_discharge"])
+df_merge_xgpredict = df_merge_xgpredict.drop(columns=["id", 
+"days_before_discharge"])
+X = df_merge_trainxg.drop("died_in_hospital", axis=1)
+y = df_merge_trainxg["died_in_hospital"]
+
+### Splitting the data into training and testing sets:
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, 
+random_state=43)
+
+### Scaling the data:
+sca = StandardScaler()
+X_train = sca.fit_transform(X_train)
+X_test = sca.transform(X_test)
+
+### Defining the parameter grid for grid search:
+param_grid = {
+ "learning_rate": [0.01, 0.1, 0.2],
+ "max_depth": [3, 4, 5],
+ "n_estimators": [50, 100, 200],
+ "subsample": [0.8, 1.0],
+ "colsample_bytree": [0.8, 1.0],
+ "gamma": [0, 0.1, 0.2],
+}
+
+### Initializing XGBoost classifier:
+model = xgb.XGBClassifier(objective="binary:logistic", random_state=42)
+
+### Using the grid search to find the best parameters:
+grid_search = GridSearchCV(estimator=model, param_grid=param_grid, 
+scoring="accuracy", cv=5)
+grid_search.fit(X_train, y_train)
+
+### Extracting the best model from the grid search:
+best_model = grid_search.best_estimator_
+
+### Adding early stopping:
+eval_set = [(X_test, y_test)]
+best_model.fit(X_train, y_train, early_stopping_rounds=10, eval_metric="logloss", 
+eval_set=eval_set, verbose=True)
+
+### Predicting with the best model:
+best_predictions = best_model.predict(X_test)
+
+### Printing the confusion matrix
+conf_matrix_final = confusion_matrix(y_test, best_predictions)
+print("Confusion Matrix for the Final Model:\n", conf_matrix_final)
+
+### Printing accuracy and the classification report:
+print("Accuracy with Best Parameters:", accuracy_score(y_test, best_predictions))
+print("\nClassification Report with Best Parameters:\n", 
+classification_report(y_test, best_predictions))
+
+### Plotting the learning curve:
+ 
+train_sizes, train_scores, test_scores = learning_curve(
+ best_model, X, y, cv=5, scoring="accuracy", train_sizes=np.linspace(0.1, 1.0, 
+10)
+)
+train_scores_mean = np.mean(train_scores, axis=1)
+train_scores_std = np.std(train_scores, axis=1)
+test_scores_mean = np.mean(test_scores, axis=1)
+test_scores_std = np.std(test_scores, axis=1)
+plt.figure(figsize=(10, 6))
+plt.fill_between(train_sizes, train_scores_mean - train_scores_std,
+ train_scores_mean + train_scores_std, alpha=0.1, color="r")
+plt.fill_between(train_sizes, test_scores_mean - test_scores_std,
+ test_scores_mean + test_scores_std, alpha=0.1, color="g")
+plt.plot(train_sizes, train_scores_mean, "o-", color="r", label="Training score")
+plt.plot(train_sizes, test_scores_mean, "o-", color="g", label="Cross-validation 
+score")
+plt.title("Learning Curve")
+plt.xlabel("Training examples")
+plt.ylabel("Score")
+plt.legend(loc="best")
+plt.show()
+
+### Finding predictions for the classification set:
+ 
+X_ans = df_merge_xgpredict.drop("died_in_hospital", axis=1)
+X_ans = sca.transform(X_ans)
+y_ans = df_merge_xgpredict["died_in_hospital"]
+best_pred_answ = best_model.predict(X_ans)
+best_pred_answ = pd.DataFrame(best_pred_answ)
+best_pred_answ.sum()
+classification_set["prediction_accuracy_model"] = best_pred_answ
+
+###############################################################################
+# QUESTION 3 #
+###############################################################################
+
+### Storing our prediction:
+predicted_deaths = best_pred_answ[0].sum()
+
+### Defining some values for later use:
+compensation_per_death = 500000
+cost_per_liability_sold = 150000
+current_patients = 1000
+
+### Computing recall and precision of our model:
+ 
+y_true = y_test
+y_pred = best_predictions
+rec = recall_score(y_true, y_pred)
+prec = precision_score(y_true, y_pred)
+
+### Creating a loop that computes the costs for each strategy depending on the 
+### Number of predicted deaths:
+ 
+cost3 = np.zeros((1000,4)) # Initializing cost matrix
+ 
+for n in np.arange(0, 1000, 1):
+ false_negatives = n*prec*(1/rec)
+ true_positives = n*prec
+ false_positives = n*(1-prec)
+ cost3[n,0] = n
+ cost3[n,1] = true_positives*cost_per_liability_sold + 
+false_negatives*compensation_per_death + false_positives*cost_per_liability_sold
+ cost3[n,2] = true_positives*compensation_per_death + 
+false_negatives*compensation_per_death 
+ cost3[n,3] = current_patients*cost_per_liability_sold
+ 
+ 
+#### Plotting the cost curves for each strategy:
+ 
+sns.set(style="whitegrid") 
+plt.figure(figsize=(10, 6)) 
+sns.lineplot(x=cost3[:, 0], y=cost3[:, 1], label="Selling predicted claims", 
+linewidth=2, color="blue")
+sns.lineplot(x=cost3[:, 0], y=cost3[:, 2], label="Doing nothing", linewidth=2, 
+color="red")
+sns.lineplot(x=cost3[:, 0], y=cost3[:, 3], label="Selling all claims", linewidth=2,
+color="green")
+xticks = np.arange(min(cost3[:, 0]), max(cost3[:, 0]) + 1, 100) 
+plt.xticks(xticks)
+yticks = plt.yticks()[0]
+plt.yticks(yticks, [str(int(ytick/1000000)) for ytick in yticks])
+plt.xlabel("Predicted deaths")
+plt.ylabel("Total cost")
+plt.legend(loc="upper left")
+plt.show()
+
+### Plotting the precision-recall curve:
+ 
+y_predprob = best_model.predict_proba(X_test)
+precision, recall, _ = precision_recall_curve(y_true, y_predprob[:,1])
+area_under_curve = auc(recall, precision)
+plt.figure(figsize=(8, 6))
+plt.plot(recall, precision, color="blue", lw=2, label=f"Precision-Recall Curve (AUC
+= {area_under_curve:.2f})")
+plt.xlabel("Recall")
+plt.ylabel("Precision")
+plt.title("Precision-Recall Curve")
+plt.legend(loc="lower left")
+plt.grid(True)
+plt.show()
+
+### Computing the threshold as function of recall:
+ 
+cost4 = np.zeros((1000, 4)) # Initializing matrices 
+intersection_points = np.ones((10, 1))
+intersection_x = 0
+for reca in np.arange(0, 1, 0.1): # loop that 
+stores the threshold value
+ closest_recall_index = np.argmin(np.abs(recall - reca)) # into the 
+intersection_points matrix
+ corresponding_precision = precision[closest_recall_index] # for each value 
+of recall
+ for n in np.arange(0, 1000, 1): # loop that 
+computes the costs for each 
+ false_negatives = n * corresponding_precision* (1 / reca) # number of 
+deaths predicted by our model
+ true_positives = n * corresponding_precision # and finds 
+the intersection point between 
+ false_positives = n * (1 - corresponding_precision) # curves
+ cost4[n, 0] = n
+ cost4[n, 1] = (
+ true_positives * cost_per_liability_sold +
+ false_negatives * compensation_per_death +
+ false_positives * cost_per_liability_sold
+ )
+ cost4[n, 2] = (
+ true_positives * compensation_per_death +
+ false_negatives * compensation_per_death
+ )
+ cost4[n, 3] = current_patients * cost_per_liability_sold
+ idx_intersection = np.argwhere(np.isclose(cost4[:, 1], cost4[:, 3], 
+rtol=1e-4, atol=1e-4))
+ # Find the intersection point
+ green_line = cost4[:, 3] 
+ blue_line = cost4[:, 1] 
+ for i in range(len(green_line) - 1):
+ if (green_line[i] <= blue_line[i] and green_line[i + 1] >= blue_line[i + 
+1]) or \
+ (green_line[i] >= blue_line[i] and green_line[i + 1] <= blue_line[i + 
+1]):
+ intersection_x = cost4[i, 0]
+ intersection_y = (green_line[i] + blue_line[i]) / 2 
+ break
+ i = int(reca * 10)
+ intersection_points[i,0] = intersection_x
+
+### Adjusting the first value:
+intersection_points[0,0] = 0
+
+### Plotting the threshold as a function of recall:
+ 
+sns.set(style="whitegrid")
+plt.figure(figsize=(10, 6))
+sns.lineplot(x=np.arange(intersection_points.shape[0]), y=intersection_points[:, 
+0], label="Selling all claims", linewidth=2, color="green")
+np.arange(intersection_points.shape[0])
+plt.figure(figsize=(10, 6))
+plt.plot(np.arange(intersection_points.shape[0]) / 10, intersection_points, 
+label="", linewidth=2, color="green")
+plt.xlabel("Recall", fontsize=20)
+plt.ylabel("Threshold", fontsize=20)
+plt.show()
+
+### Updating our final prediction dataframe:
+classification_set["prediction_accuracy_model"] = best_pred_answ
+classification_set2 = pd.merge(classification_set, white_blood_cell_count, on = 
+"patient_id", how="left") 
+classification_set2.rename(columns={"White Blood Cell Count": "white blood cell 
+count"}, inplace=True)
+classification_set2["prediction_profit_model"] = best_pred_answ
+classification_set2.to_json("42444_take_home_exam.json", orient="records", 
+indent=2)
